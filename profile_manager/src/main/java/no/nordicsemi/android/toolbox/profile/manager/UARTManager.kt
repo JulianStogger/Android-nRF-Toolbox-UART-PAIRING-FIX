@@ -18,6 +18,12 @@ import timber.log.Timber
 import java.util.UUID
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.toKotlinUuid
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.retryWhen
+import no.nordicsemi.kotlin.ble.core.BondState
 
 private val UART_RX_CHARACTERISTIC_UUID: UUID =
     UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -35,20 +41,37 @@ internal class UARTManager : ServiceManager {
         scope: CoroutineScope
     ) {
         withContext(scope.coroutineContext) {
-            remoteService.characteristics.firstOrNull { it.uuid == UART_TX_CHARACTERISTIC_UUID.toKotlinUuid() }
-                ?.subscribe()
+            val txCharacteristic = remoteService.characteristics
+                .firstOrNull { it.uuid == UART_TX_CHARACTERISTIC_UUID.toKotlinUuid() }
+
+            txCharacteristic?.subscribe()
+                ?.retryWhen { cause, attempt ->
+                    Timber.tag("UARTManager").w("Subscription failed (attempt $attempt)")
+                    
+                    if (attempt < 3) {
+                        // We use a simple delay here to bypass the 'device' reference issue
+                        // while still giving the OS time to bond.
+                        delay(2000) 
+                        true 
+                    } else {
+                        false
+                    }
+                }
                 ?.mapNotNull { String(it) }
                 ?.onEach { UartRepository.onNewMessageReceived(deviceId, it) }
-                ?.catch { it.printStackTrace() }
+                ?.catch { e ->
+                    Timber.tag("UARTManager").e(e, "NUS TX Subscription failed permanently")
+                }
                 ?.onCompletion {
-                    // Clear the device resources.
                     UartRepository.clear(deviceId)
                 }
                 ?.launchIn(scope)
 
-            val writeCharacteristics =
-                remoteService.characteristics.firstOrNull { it.uuid == UART_RX_CHARACTERISTIC_UUID.toKotlinUuid() }
-                    ?.also { rxCharacteristic = it }
+            // RX Characteristic (Writing to peripheral)
+            val writeCharacteristics = remoteService.characteristics
+                .firstOrNull { it.uuid == UART_RX_CHARACTERISTIC_UUID.toKotlinUuid() }
+                ?.also { rxCharacteristic = it }
+
             writeCharacteristics?.properties?.let {
                 if (it.contains(CharacteristicProperty.WRITE_WITHOUT_RESPONSE)) {
                     rxCharacteristicWriteType = WriteType.WITHOUT_RESPONSE
